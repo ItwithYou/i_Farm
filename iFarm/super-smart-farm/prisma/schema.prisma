@@ -1,0 +1,175 @@
+// prisma/schema.prisma
+// Super Smart Farm System — relational financial ledger.
+// Money is stored as Decimal (Postgres NUMERIC), never Float, to avoid
+// floating-point corruption of currency math.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // Supabase pooled connection (pgbouncer)
+  directUrl = env("DIRECT_URL")   // Supabase direct connection for migrations
+}
+
+/// Supported currencies. Stored as an enum so the app, DB, and FX table
+/// can never drift out of sync. LAK is the reporting/base currency.
+enum Currency {
+  LAK // ກີບ      — Lao Kip (base / reporting currency)
+  THB // ບາດ      — Thai Baht
+  USD // ໂດລາ     — US Dollar
+  CNY // ຢວນ      — Chinese Yuan
+}
+
+enum TransactionType {
+  INCOME // ລາຍຮັບ
+  EXPENSE // ລາຍຈ່າຍ
+}
+
+enum BatchStatus {
+  ACTIVE // ກຳລັງດຳເນີນ
+  COMPLETED // ສຳເລັດ
+}
+
+enum AdvanceStatus {
+  OUTSTANDING // ຍັງບໍ່ທັນຊຳລະ
+  PARTIAL // ຊຳລະບາງສ່ວນ
+  REPAID // ຊຳລະຄົບແລ້ວ
+}
+
+/// Production cycle (ງວດໄກ່). Per-batch P&L is computed from related transactions.
+model Batch {
+  id        String      @id @default(cuid())
+  name      String // e.g. "ງວດ 3"
+  startDate DateTime    @db.Date
+  endDate   DateTime?   @db.Date // null while ACTIVE
+  status    BatchStatus @default(ACTIVE)
+  notes     String?
+
+  transactions Transaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+/// Tier 1 of the chart of accounts. `isExpense` distinguishes expenditure
+/// vs. revenue heads. `isCapital` separates CapEx (construction/improvement)
+/// from OpEx (farm operations) — useful for excluding CapEx from batch P&L.
+model Category {
+  id        String  @id @default(cuid())
+  codeId    String  @unique // your legacy "Main Category Code"
+  name      String // e.g. "ກໍ່ສ້າງ/ປັບປຸງຟາມ", "ການດຳເນີນງານຟາມ"
+  isExpense Boolean
+  isCapital Boolean @default(false) // true = Capital Expenditure
+
+  subCategories SubCategory[]
+
+  @@index([isExpense])
+}
+
+/// Tier 2 of the chart of accounts.
+model SubCategory {
+  id         String @id @default(cuid())
+  categoryId String
+  name       String // "Sub_Name"
+
+  category     Category      @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  transactions Transaction[]
+
+  @@unique([categoryId, name])
+  @@index([categoryId])
+}
+
+/// The core ledger line. Multi-currency amounts are stored side-by-side per
+/// requirement. `amountLakEquivalent` is a *denormalized snapshot* of the total
+/// converted to LAK at the transaction's FX rate — see README.
+model Transaction {
+  id          String          @id @default(cuid())
+  date        DateTime        @db.Date
+  type        TransactionType
+  description String // "ເນື້ອໃນ" / content
+  notes       String?
+
+  // --- Multi-currency amounts (Decimal, NOT Float) ---
+  amountLak Decimal @default(0) @db.Decimal(18, 2)
+  amountThb Decimal @default(0) @db.Decimal(18, 2)
+  amountUsd Decimal @default(0) @db.Decimal(18, 2)
+  amountCny Decimal @default(0) @db.Decimal(18, 2)
+
+  /// Snapshot of the full line value expressed in LAK at posting time.
+  /// Lets dashboards sum historical P&L without re-fetching old FX rates.
+  amountLakEquivalent Decimal @db.Decimal(20, 2)
+
+  // --- Accounting flags ---
+  /// `Include_in_batch_profit`. When false, the line is excluded from
+  /// per-batch P&L (e.g. shared admin overhead, capital construction).
+  pnlInclusion Boolean @default(true)
+
+  // --- Relations ---
+  batchId       String? // nullable: not all lines belong to a batch
+  subCategoryId String
+
+  batch       Batch?      @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  subCategory SubCategory @relation(fields: [subCategoryId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([batchId])
+  @@index([date])
+  @@index([type])
+  @@index([batchId, pnlInclusion]) // optimizes batch P&L queries
+}
+
+/// Capital injected by family members — a LIABILITY, not income.
+/// Tracked separately so it never pollutes the P&L. `outstanding` is derived
+/// (original − repaid) in the app layer.
+model CapitalAdvance {
+  id             String        @id @default(cuid())
+  creditorName   String // e.g. "ພໍ່", "ແມ່"
+  currency       Currency      @default(LAK)
+  originalAmount Decimal       @db.Decimal(20, 2)
+  repaidAmount   Decimal       @default(0) @db.Decimal(20, 2)
+  status         AdvanceStatus @default(OUTSTANDING)
+  advanceDate    DateTime      @db.Date
+  notes          String?
+
+  // Optional: link individual repayments to ledger transactions for audit trail
+  repayments AdvanceRepayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creditorName])
+  @@index([status])
+}
+
+/// Individual repayment events against an advance (audit trail).
+/// Append-only log is preferred over a single mutable `repaidAmount` field.
+model AdvanceRepayment {
+  id        String   @id @default(cuid())
+  advanceId String
+  amount    Decimal  @db.Decimal(20, 2)
+  currency  Currency @default(LAK)
+  date      DateTime @db.Date
+  notes     String?
+
+  advance CapitalAdvance @relation(fields: [advanceId], references: [id], onDelete: Cascade)
+
+  @@index([advanceId])
+}
+
+/// Effective-dated FX rates. One row per (currency → LAK) per effective date.
+/// Always store rates relative to the base currency (LAK) to avoid triangulation bugs.
+model ExchangeRate {
+  id            String   @id @default(cuid())
+  currency      Currency // the foreign currency
+  rateToLak     Decimal  @db.Decimal(20, 8) // 1 unit of `currency` = rateToLak LAK
+  effectiveDate DateTime @db.Date
+
+  @@unique([currency, effectiveDate])
+  @@index([currency, effectiveDate])
+}
